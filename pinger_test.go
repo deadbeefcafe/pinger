@@ -63,6 +63,10 @@ func TestPing(t *testing.T) {
 	h.Close()
 	time.Sleep(3 * time.Second)
 
+	for i, h := range pinger.GetHosts() {
+		log.Printf("%3d %-20.20s %s", i, h.Address, h.String())
+	}
+
 	pinger.Stop()
 
 }

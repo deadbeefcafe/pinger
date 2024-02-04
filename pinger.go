@@ -1,9 +1,11 @@
 package pinger
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"sync"
 	"time"
 
@@ -267,5 +269,8 @@ func (p *Pinger) GetHosts() (hosts []*Host) {
 	for _, h := range p.hosts {
 		hosts = append(hosts, h)
 	}
+	sort.Slice(hosts, func(i, j int) bool {
+		return bytes.Compare(hosts[i].ipaddr.IP, hosts[j].ipaddr.IP) < 0
+	})
 	return
 }
