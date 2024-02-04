@@ -261,3 +261,11 @@ func (p *Pinger) AddHost(addr string, fx HostCallbackFunc) (h *Host, err error) 
 
 	return
 }
+
+func (p *Pinger) GetHosts() (hosts []*Host) {
+	hosts = []*Host{}
+	for _, h := range p.hosts {
+		hosts = append(hosts, h)
+	}
+	return
+}
