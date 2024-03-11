@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"sort"
 	"sync"
@@ -15,9 +16,26 @@ import (
 
 type HostCallbackFunc func(h *Host, msg string, arg string)
 
+type Rtt struct {
+	T      time.Time
+	D      time.Duration
+	UpDown int
+	Err    error
+	Msg    string
+	Arg    string
+}
+
+func (r *Rtt) String() string {
+	if r.Err != nil {
+		return fmt.Sprintf("%s %10s %4d %s %s %v", r.T.Format("2006-01-02T15:04:05.000000"), r.D.Truncate(time.Microsecond), r.UpDown, r.Msg, r.Arg, r.Err)
+	}
+	return fmt.Sprintf("%s %10s %4d %s %s", r.T.Format("2006-01-02T15:04:05.000000"), r.D.Truncate(time.Microsecond), r.UpDown, r.Msg, r.Arg)
+}
+
 type Host struct {
 	Address         string
 	IsUp            bool
+	UpDown          int // >1 up <-1 down 0=unknown
 	PacketsSent     int
 	PacketsReceived int
 	UpTime          time.Duration // total amount of time host has been up
@@ -25,23 +43,34 @@ type Host struct {
 	Interval        time.Duration // time between pings
 	MaxRTT          time.Duration // rtt greater than this value will declare a host down
 	Timeout         time.Duration // wait this long at most for a pong
-	RTT             time.Duration // latest RTT value
+	LastRTT         time.Duration // latest RTT value
 	Stats           f64stat.Stat  // RTT stats.  min/ave/max/sdev
 	C               chan string   // channel to send command to the pinger go routine
 	tLastChange     time.Time     // time of last change in Up/Down state
 	tLastPacket     time.Time     // time of last change in Up/Down state
-	ipaddr          *net.IPAddr
-	run             bool
-	callback        HostCallbackFunc
+	tSent           time.Time     // time last packet sent
+	//ltDown           time.Time     // time of start of last DOWN
+	//downCount       int           // number of missed pongs
+	DownThreshold int    // number of missed pongs to declare host down
+	History       []*Rtt // RTT and message history
+	HistoryMax    int    // Maximum size of history
+
+	ipaddr   *net.IPAddr
+	run      bool
+	callback HostCallbackFunc
 }
 
 func (h *Host) doCallback(msg string, arg string) {
 	if h.callback == nil {
 		return
 	}
+	if msg != "RTT" {
+		h.RecordEvent(time.Now(), 0, h.UpDown, nil, msg, arg)
+	}
 	h.callback(h, msg, arg)
 }
 
+/*
 func (h *Host) addRTT(rtt time.Duration) {
 	up := true
 	now := time.Now()
@@ -86,6 +115,7 @@ func (h *Host) addRTT(rtt time.Duration) {
 		h.IsUp = up
 	}
 }
+*/
 
 func (h *Host) String() string {
 	return fmt.Sprintf("txrx: %d %d loss: %4.1f%% rtt: %.2f/%.2f/%.2f/%.4f up: %s down: %s",
@@ -93,6 +123,17 @@ func (h *Host) String() string {
 		100.0-100.0*float64(h.PacketsReceived)/float64(h.PacketsSent),
 		1000*h.Stats.Min(), 1000*h.Stats.Ave(), 1000*h.Stats.Max(), 1000*h.Stats.Stddev(),
 		h.UpTime.Round(time.Second), h.DownTime.Round(time.Second))
+}
+
+func (h *Host) RecordEvent(t time.Time, rtt time.Duration, updown int, err error, msg string, arg string) {
+	if h.HistoryMax <= 0 {
+		return
+	}
+	h.History = append(h.History, &Rtt{T: t, D: rtt, UpDown: updown, Err: err, Msg: msg, Arg: arg})
+	l := len(h.History)
+	if l > 10 && l > h.HistoryMax {
+		h.History = h.History[10:]
+	}
 }
 
 func (h *Host) runHostPing(p *Pinger) {
@@ -104,15 +145,41 @@ func (h *Host) runHostPing(p *Pinger) {
 	loop:
 		for h.run {
 			select {
-			case <-ticker.C:
+			case now := <-ticker.C:
 				if !doping {
 					continue
 				}
+				h.PacketsSent++
 				rtt, err := p.pinger.Ping(h.ipaddr, h.Timeout)
+				//h.History = append(h.History, &Rtt{T: now, D: rtt})
+				h.RecordEvent(now, rtt, h.UpDown, err, "PING", "")
 				if err != nil {
-					rtt = h.MaxRTT
+					//msg := fmt.Sprintf("err: %v rtt: %v", err, rtt)
+					//if h.UpDown > -5 { h.doCallback("MISS", fmt.Sprintf("%v", err)) }
+					if h.UpDown > 0 {
+						h.UpDown = 0
+					}
+					h.UpDown--
+					if h.UpDown == -h.DownThreshold {
+						h.doCallback("DOWN", "")
+					}
+					continue
 				}
-				h.addRTT(rtt)
+				// Got PONG
+				if h.UpDown <= 0 {
+					downtime := time.Since(h.tSent)
+					h.DownTime += downtime
+					h.doCallback("UP", "Was DOWN for "+downtime.String())
+					h.UpDown = 0
+				}
+				h.UpDown++
+				if h.UpDown >= 0 {
+					h.tSent = now
+				}
+				h.doCallback("RTT", rtt.String())
+				h.Stats.Add(rtt.Seconds())
+				h.PacketsReceived++
+				h.LastRTT = rtt
 			case cmd := <-h.C:
 				switch cmd {
 				case "cancel":
@@ -178,25 +245,29 @@ func (h *Host) SetInterval(d time.Duration) {
 }
 
 type Pinger struct {
-	pinger      *ping.Pinger
-	running     bool
-	wg          sync.WaitGroup
-	hosts       map[string]*Host
-	Bind4       string
-	Bind6       string
-	PayloadSize uint16
-	Interval    time.Duration // default ping interval
-	MaxRTT      time.Duration // default host down threshold
+	pinger        *ping.Pinger
+	running       bool
+	wg            sync.WaitGroup
+	hosts         map[string]*Host
+	Bind4         string
+	Bind6         string
+	PayloadSize   uint16
+	Interval      time.Duration // default ping interval
+	MaxRTT        time.Duration // default host down threshold
+	DownThreshold int           // number of missed pongs to declare host down
+	HistoryMax    int           // maximum size of history.  0=off
 }
 
 func New() *Pinger {
 	return &Pinger{
-		hosts:       make(map[string]*Host),
-		Bind4:       "0.0.0.0",
-		Bind6:       "::",
-		PayloadSize: 56,
-		Interval:    1 * time.Second,
-		MaxRTT:      1 * time.Second,
+		hosts:         make(map[string]*Host),
+		Bind4:         "0.0.0.0",
+		Bind6:         "::",
+		PayloadSize:   56,
+		Interval:      1 * time.Second,
+		MaxRTT:        1 * time.Second,
+		DownThreshold: 2,
+		HistoryMax:    1000,
 	}
 }
 
@@ -204,6 +275,7 @@ func (p *Pinger) Start() (err error) {
 	if p.running {
 		return
 	}
+	log.Printf("XXXX PINGER START")
 	p.pinger, err = ping.New(p.Bind4, p.Bind6)
 	if err != nil {
 		return
@@ -249,13 +321,16 @@ func (p *Pinger) AddHost(addr string, fx HostCallbackFunc) (h *Host, err error) 
 	}
 
 	h = &Host{
-		Address:  addr,
-		ipaddr:   &net.IPAddr{IP: net.ParseIP(addr)},
-		Interval: p.Interval,
-		Timeout:  p.Interval - 10*time.Millisecond,
-		MaxRTT:   p.MaxRTT,
-		C:        make(chan string),
-		callback: fx,
+		Address:       addr,
+		ipaddr:        &net.IPAddr{IP: net.ParseIP(addr)},
+		Interval:      p.Interval,
+		Timeout:       p.Interval - 50*time.Millisecond,
+		MaxRTT:        p.MaxRTT,
+		C:             make(chan string),
+		callback:      fx,
+		DownThreshold: p.DownThreshold,
+		History:       []*Rtt{},
+		HistoryMax:    p.HistoryMax,
 	}
 
 	p.hosts[addr] = h
