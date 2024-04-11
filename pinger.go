@@ -38,6 +38,7 @@ type Host struct {
 	UpDown          int // >1 up <-1 down 0=unknown
 	PacketsSent     int
 	PacketsReceived int
+	Changes         int           // number of up->down or down->up transitions
 	UpTime          time.Duration // total amount of time host has been up
 	DownTime        time.Duration // total amount of time host has been down
 	Interval        time.Duration // time between pings
@@ -70,59 +71,13 @@ func (h *Host) doCallback(msg string, arg string) {
 	h.callback(h, msg, arg)
 }
 
-/*
-func (h *Host) addRTT(rtt time.Duration) {
-	up := true
-	now := time.Now()
-	if rtt >= h.MaxRTT {
-		up = false
-	} else {
-		h.doCallback("RTT", rtt.String())
-		h.Stats.Add(rtt.Seconds())
-		h.PacketsReceived++
-		h.RTT = rtt
-	}
-	if h.PacketsSent == 0 {
-		h.tLastChange = now
-		h.tLastPacket = now
-		h.IsUp = !up
-	}
-	h.PacketsSent++
-
-	if up {
-		h.UpTime += time.Since(h.tLastPacket)
-	} else {
-		h.DownTime += time.Since(h.tLastPacket)
-	}
-	h.tLastPacket = now
-
-	if up != h.IsUp {
-		dt := time.Since(h.tLastChange)
-		if up {
-			d := ""
-			if dt > 10*time.Millisecond {
-				d = dt.String()
-			}
-			h.doCallback("UP", d)
-		} else {
-			d := ""
-			if dt > 10*time.Millisecond {
-				d = dt.String()
-			}
-			h.doCallback("DOWN", d)
-		}
-		h.tLastChange = now
-		h.IsUp = up
-	}
-}
-*/
-
 func (h *Host) String() string {
-	return fmt.Sprintf("txrx: %d %d loss: %4.1f%% rtt: %.2f/%.2f/%.2f/%.4f up: %s down: %s",
+
+	return fmt.Sprintf("txrx: %d %d loss: %4.1f%% rtt: %.2f/%.2f/%.2f/%.4f up: %s down: %s chg: %d",
 		h.PacketsSent, h.PacketsReceived,
 		100.0-100.0*float64(h.PacketsReceived)/float64(h.PacketsSent),
 		1000*h.Stats.Min(), 1000*h.Stats.Ave(), 1000*h.Stats.Max(), 1000*h.Stats.Stddev(),
-		h.UpTime.Round(time.Second), h.DownTime.Round(time.Second))
+		h.UpTime.Round(time.Second), h.DownTime.Round(time.Second), h.Changes)
 }
 
 func (h *Host) RecordEvent(t time.Time, rtt time.Duration, updown int, err error, msg string, arg string) {
@@ -145,41 +100,52 @@ func (h *Host) runHostPing(p *Pinger) {
 	loop:
 		for h.run {
 			select {
-			case now := <-ticker.C:
+			case t := <-ticker.C:
 				if !doping {
 					continue
 				}
 				h.PacketsSent++
 				rtt, err := p.pinger.Ping(h.ipaddr, h.Timeout)
 				//h.History = append(h.History, &Rtt{T: now, D: rtt})
-				h.RecordEvent(now, rtt, h.UpDown, err, "PING", "")
-				if err != nil {
-					//msg := fmt.Sprintf("err: %v rtt: %v", err, rtt)
-					//if h.UpDown > -5 { h.doCallback("MISS", fmt.Sprintf("%v", err)) }
+				h.RecordEvent(t, rtt, h.UpDown, err, "PING", "")
+				if err != nil || rtt > h.MaxRTT {
+					// timeout no PONG
 					if h.UpDown > 0 {
 						h.UpDown = 0
 					}
 					h.UpDown--
 					if h.UpDown == -h.DownThreshold {
-						h.doCallback("DOWN", "")
+						h.doCallback("DOWN", "Was UP for "+time.Since(h.tLastChange).Round(time.Millisecond).String())
+						h.tLastChange = t
+						h.Changes++
 					}
-					continue
+					h.DownTime += h.Interval
+				} else {
+					// Got PONG
+					if h.UpDown == 0 {
+						h.tLastChange = t
+						h.doCallback("UP", "")
+					} else if h.UpDown <= -h.DownThreshold {
+						down := time.Since(h.tLastChange)
+						h.tLastChange = t
+						if down < time.Hour*24*7 {
+							h.doCallback("UP", "Was DOWN for "+down.Round(time.Millisecond).String())
+						} else {
+							h.doCallback("UP", "Was DOWN")
+						}
+						h.IsUp = false
+						h.Changes++
+						h.UpDown = 0
+					}
+					h.IsUp = true
+					h.UpDown++
+					h.doCallback("RTT", rtt.String())
+					h.Stats.Add(rtt.Seconds())
+					h.PacketsReceived++
+					h.LastRTT = rtt
+					h.UpTime += h.Interval
 				}
-				// Got PONG
-				if h.UpDown <= 0 {
-					downtime := time.Since(h.tSent)
-					h.DownTime += downtime
-					h.doCallback("UP", "Was DOWN for "+downtime.String())
-					h.UpDown = 0
-				}
-				h.UpDown++
-				if h.UpDown >= 0 {
-					h.tSent = now
-				}
-				h.doCallback("RTT", rtt.String())
-				h.Stats.Add(rtt.Seconds())
-				h.PacketsReceived++
-				h.LastRTT = rtt
+				h.tSent = t
 			case cmd := <-h.C:
 				switch cmd {
 				case "cancel":
