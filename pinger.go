@@ -214,6 +214,7 @@ type Pinger struct {
 	pinger        *ping.Pinger
 	running       bool
 	wg            sync.WaitGroup
+	mu            sync.RWMutex
 	hosts         map[string]*Host
 	Bind4         string
 	Bind6         string
@@ -255,7 +256,7 @@ func (p *Pinger) Start() (err error) {
 
 var ErrHostNotExist = errors.New("host does not exist")
 
-func (p *Pinger) RemoveHost(host string) (err error) {
+func (p *Pinger) removeHost(host string) (err error) {
 	h, ok := p.hosts[host]
 	if !ok {
 		return ErrHostNotExist
@@ -267,11 +268,19 @@ func (p *Pinger) RemoveHost(host string) (err error) {
 	delete(p.hosts, host)
 	return
 }
+func (p *Pinger) RemoveHost(host string) (err error) {
+	p.mu.Lock()
+	err = p.removeHost(host)
+	p.mu.Unlock()
+	return
+}
 
 func (p *Pinger) Stop() {
+	p.mu.Lock()
 	for _, h := range p.hosts {
-		p.RemoveHost(h.Address)
+		p.removeHost(h.Address)
 	}
+	p.mu.Unlock()
 	p.wg.Wait()
 	p.pinger.Close()
 	p.running = false
@@ -280,6 +289,9 @@ func (p *Pinger) Stop() {
 var ErrHostExists = errors.New("host already exists")
 
 func (p *Pinger) AddHost(addr string, fx HostCallbackFunc) (h *Host, err error) {
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
 	if _, ok := p.hosts[addr]; ok {
 		err = ErrHostExists
@@ -300,6 +312,7 @@ func (p *Pinger) AddHost(addr string, fx HostCallbackFunc) (h *Host, err error) 
 	}
 
 	p.hosts[addr] = h
+
 	go h.runHostPing(p)
 
 	return
@@ -307,9 +320,11 @@ func (p *Pinger) AddHost(addr string, fx HostCallbackFunc) (h *Host, err error) 
 
 func (p *Pinger) GetHosts() (hosts []*Host) {
 	hosts = []*Host{}
+	p.mu.RLock()
 	for _, h := range p.hosts {
 		hosts = append(hosts, h)
 	}
+	p.mu.RUnlock()
 	sort.Slice(hosts, func(i, j int) bool {
 		return bytes.Compare(hosts[i].ipaddr.IP, hosts[j].ipaddr.IP) < 0
 	})
